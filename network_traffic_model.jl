@@ -3,15 +3,11 @@ using CSV
 using Dates
 using Statistics
 using Random
-using ScikitLearn
 using MLJ
 using LinearAlgebra
 
-@sk_import preprocessing: StandardScaler
-@sk_import ensemble: RandomForestClassifier
-@sk_import model_selection: cross_val_score
-@sk_import metrics: confusion_matrix
-@sk_import metrics: classification_report
+# Load MLJ models
+RandomForestClassifier = @load RandomForestClassifier pkg=DecisionTree
 
 """
 Structure to handle IP address features
@@ -53,22 +49,20 @@ end
 Main model structure with preprocessing components
 """
 mutable struct NetworkTrafficModel
-    scaler::StandardScaler
-    model::RandomForestClassifier
+    scaler
+    model
     feature_names::Vector{String}
     attack_types::Vector{String}
     protocols::Vector{String}
     
     function NetworkTrafficModel()
         new(
-            StandardScaler(),
+            Standardizer(),
             RandomForestClassifier(
-                n_estimators=200,
+                n_trees=200,
                 max_depth=15,
-                min_samples_split=5,
                 min_samples_leaf=2,
-                random_state=42,
-                class_weight="balanced"
+                rng=42
             ),
             String[],
             String[],
@@ -174,4 +168,219 @@ function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=tr
     n_samples = nrow(df)
     features = Vector{Float64}[]
     
-    for i in 1:n
+    for i in 1:n_samples
+        row_features = Float64[]
+        
+        # Process timestamp
+        append!(row_features, process_timestamp(df[i, :Timestamp]))
+        
+        # Process IPs
+        source_ip = IPAddress(df[i, :Source_IP])
+        dest_ip = IPAddress(df[i, :Destination_IP])
+        
+        append!(row_features, extract_ip_features(source_ip))
+        append!(row_features, extract_ip_features(dest_ip))
+        append!(row_features, calculate_topology_features(source_ip, dest_ip))
+        
+        # Process protocol features
+        append!(row_features, calculate_protocol_features(
+            df[i, :Protocol],
+            df[i, :Packet_Size],
+            df[i, :Request_Rate]
+        ))
+        
+        # Add raw metrics
+        push!(row_features, Float64(df[i, :Packet_Size]))
+        push!(row_features, Float64(df[i, :Request_Rate]))
+        
+        push!(features, row_features)
+    end
+    
+    # Convert to matrix
+    X = reduce(hcat, features)'
+    
+    if training
+        # Create feature names
+        model.feature_names = [
+            "Hour", "Minute", "Second",
+            "Src_Oct1", "Src_Oct2", "Src_Oct3", "Src_Oct4",
+            "Src_ClassA", "Src_ClassB", "Src_ClassC", "Src_ClassD", "Src_ClassE",
+            "Src_Private",
+            "Dst_Oct1", "Dst_Oct2", "Dst_Oct3", "Dst_Oct4",
+            "Dst_ClassA", "Dst_ClassB", "Dst_ClassC", "Dst_ClassD", "Dst_ClassE",
+            "Dst_Private",
+            "Subnet_Similarity", "Same_Class", "Privacy_Pattern",
+            "Protocol_Overhead", "Protocol_Efficiency", "Protocol_Risk",
+            "Packet_Size", "Request_Rate"
+        ]
+    end
+    
+    # Scale features
+    if training
+        mach = machine(model.scaler, X)
+        fit!(mach)
+        X_scaled = transform(mach, X)
+    else
+        mach = machine(model.scaler, X)
+        X_scaled = transform(mach, X)
+    end
+    
+    return X_scaled
+end
+
+"""
+Train the model with cross-validation
+"""
+function train!(model::NetworkTrafficModel, df::DataFrame)
+    println("Preprocessing data...")
+    X = preprocess_data!(model, df)
+    
+    # Convert attack types to categorical
+    y = categorical(df.Attack_Type)
+    
+    println("\nPerforming cross-validation...")
+    cv = CV(; nfolds=5)
+    mach = machine(model.model, X, y)
+    cv_scores = evaluate!(mach, resampling=cv, measure=accuracy)
+    
+    println("Cross-validation scores: ", cv_scores.per_fold)
+    println("Mean CV score: ", cv_scores.measurement[1])
+    
+    println("\nTraining final model...")
+    fit!(mach)
+    
+    # Get feature importances if available
+    if hasproperty(model.model, :feature_importances)
+        importances = feature_importance(mach)
+        println("\nTop 10 Most Important Features:")
+        sorted_features = sort(collect(zip(model.feature_names, importances)), 
+                             by=x->x[2], rev=true)
+        for (feature, importance) in sorted_features[1:10]
+            println("$feature: $(round(importance, digits=3))")
+        end
+    end
+    
+    return Dict(
+        "cv_scores" => cv_scores.per_fold,
+        "mean_cv_score" => cv_scores.measurement[1]
+    )
+end
+
+"""
+Make predictions with confidence scores
+"""
+function predict(model::NetworkTrafficModel, df::DataFrame)
+    X = preprocess_data!(model, df, training=false)
+    predictions = model.model.predict(X)
+    probabilities = model.model.predict_proba(X)
+    
+    # Convert numeric predictions back to attack types
+    predicted_attacks = model.attack_types[predictions .+ 1]
+    
+    # Create results DataFrame
+    results = DataFrame(
+        Source_IP = df.Source_IP,
+        Destination_IP = df.Destination_IP,
+        Protocol = df.Protocol,
+        Predicted_Attack = predicted_attacks,
+        Confidence = [maximum(prob) * 100 for prob in probabilities]
+    )
+    
+    # Add risk assessment
+    results.Risk_Level = map(1:nrow(df)) do i
+        confidence = results[i, :Confidence]
+        protocol_risk = calculate_protocol_features(
+            df[i, :Protocol],
+            df[i, :Packet_Size],
+            df[i, :Request_Rate]
+        )[3]  # Get protocol risk score
+        
+        # Combined risk score
+        risk_score = (confidence/100 + protocol_risk) / 2
+        
+        if risk_score > 0.8
+            "High"
+        elseif risk_score > 0.5
+            "Medium"
+        else
+            "Low"
+        end
+    end
+    
+    return results
+end
+
+"""
+Evaluate model performance
+"""
+function evaluate_model(model::NetworkTrafficModel, df::DataFrame)
+    X = preprocess_data!(model, df, training=false)
+    
+    # Get true and predicted labels
+    label_map = Dict(attack => i-1 for (i, attack) in enumerate(model.attack_types))
+    y_true = [label_map[attack] for attack in df.Attack_Type]
+    y_pred = model.model.predict(X)
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Print classification report
+    println("\nClassification Report:")
+    println(classification_report(y_true, y_pred, 
+                                target_names=model.attack_types))
+    
+    # Calculate per-class metrics
+    println("\nPer-Class Performance:")
+    for (i, attack_type) in enumerate(model.attack_types)
+        true_pos = cm[i,i]
+        false_pos = sum(cm[:,i]) - true_pos
+        false_neg = sum(cm[i,:]) - true_pos
+        
+        precision = true_pos / (true_pos + false_pos)
+        recall = true_pos / (true_pos + false_neg)
+        f1 = 2 * (precision * recall) / (precision + recall)
+        
+        println("\n$attack_type:")
+        println("Precision: $(round(precision, digits=3))")
+        println("Recall: $(round(recall, digits=3))")
+        println("F1-score: $(round(f1, digits=3))")
+    end
+    
+    return Dict(
+        "confusion_matrix" => cm,
+        "classification_report" => classification_report(y_true, y_pred, 
+                                                      target_names=model.attack_types)
+    )
+end
+
+# Example usage
+function main()
+    println("Loading data...")
+    df = CSV.read("network_traffic.csv", DataFrame)
+    
+    println("\nInitializing model...")
+    model = NetworkTrafficModel()
+    
+    println("\nTraining model...")
+    train_results = train!(model, df)
+    
+    println("\nEvaluating model...")
+    eval_results = evaluate_model(model, df)
+    
+    println("\nMaking predictions...")
+    predictions = predict(model, df)
+    
+    println("\nSample predictions:")
+    first_predictions = first(predictions, 5)
+    for row in eachrow(first_predictions)
+        println("\nSource IP: $(row.Source_IP) → Destination IP: $(row.Destination_IP)")
+        println("Protocol: $(row.Protocol)")
+        println("Predicted Attack: $(row.Predicted_Attack)")
+        println("Confidence: $(round(row.Confidence, digits=1))%")
+        println("Risk Level: $(row.Risk_Level)")
+    end
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
