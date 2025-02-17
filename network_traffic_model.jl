@@ -6,8 +6,8 @@ using Random
 using MLJ
 using LinearAlgebra
 
-# Load MLJ model
-RandomForestClassifier = @load RandomForestClassifier pkg="MLJDecisionTreeInterface"
+# Load XGBoost classifier
+XGBoostClassifier = @load XGBoostClassifier pkg=XGBoost
 
 """
 Structure to handle IP address features
@@ -64,11 +64,11 @@ mutable struct NetworkTrafficModel
     function NetworkTrafficModel()
         new(
             Standardizer(),
-            RandomForestClassifier(
-                n_trees=200,
-                max_depth=15,
-                min_samples_leaf=2,
-                rng=42
+            XGBoostClassifier(
+                num_round=100,
+                max_depth=6,
+                eta=0.3,
+                objective="multi:softprob"
             ),
             String[],
             String[],
@@ -77,6 +77,7 @@ mutable struct NetworkTrafficModel
         )
     end
 end
+
 
 """
 Convert timestamp to numeric features
