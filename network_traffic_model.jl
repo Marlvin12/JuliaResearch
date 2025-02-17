@@ -17,31 +17,36 @@ struct IPAddress
     class::Char
     is_private::Bool
     
-    function IPAddress(ip_str::String)
-        octets = parse.(Int, split(ip_str, "."))
-        first_octet = octets[1]
-        
-        # Determine IP class
-        class = if first_octet < 128
-            'A'
-        elseif first_octet < 192
-            'B'
-        elseif first_octet < 224
-            'C'
-        elseif first_octet < 240
-            'D'
-        else
-            'E'
+    function IPAddress(ip_str::AbstractString)
+        try
+            octets = parse.(Int, split(String(ip_str), "."))
+            first_octet = octets[1]
+            
+            # Determine IP class
+            class = if first_octet < 128
+                'A'
+            elseif first_octet < 192
+                'B'
+            elseif first_octet < 224
+                'C'
+            elseif first_octet < 240
+                'D'
+            else
+                'E'
+            end
+            
+            # Check if private IP
+            is_private = (
+                (octets[1] == 10) ||
+                (octets[1] == 172 && 16 <= octets[2] <= 31) ||
+                (octets[1] == 192 && octets[2] == 168)
+            )
+            
+            new(octets, class, is_private)
+        catch e
+            @warn "Error parsing IP address: $ip_str"
+            new([0,0,0,0], 'A', false)  # Default values
         end
-        
-        # Check if private IP
-        is_private = (
-            (octets[1] == 10) ||
-            (octets[1] == 172 && 16 <= octets[2] <= 31) ||
-            (octets[1] == 192 && octets[2] == 168)
-        )
-        
-        new(octets, class, is_private)
     end
 end
 
@@ -54,6 +59,7 @@ mutable struct NetworkTrafficModel
     feature_names::Vector{String}
     attack_types::Vector{String}
     protocols::Vector{String}
+    machine  # Store the fitted machine
     
     function NetworkTrafficModel()
         new(
@@ -66,7 +72,8 @@ mutable struct NetworkTrafficModel
             ),
             String[],
             String[],
-            String[]
+            String[],
+            nothing
         )
     end
 end
@@ -74,13 +81,36 @@ end
 """
 Convert timestamp to numeric features
 """
-function process_timestamp(ts::String)
-    time_components = map(x -> parse(Int, x), split(ts, ":"))
-    return [
-        time_components[1] / 24.0,  # Hour normalized
-        time_components[2] / 60.0,  # Minute normalized
-        time_components[3] / 60.0   # Second normalized
-    ]
+function process_timestamp(ts::AbstractString)
+    try
+        time_components = map(x -> parse(Int, x), split(String(ts), ":"))
+        return [
+            time_components[1] / 24.0,  # Hour normalized
+            time_components[2] / 60.0,  # Minute normalized
+            time_components[3] / 60.0   # Second normalized
+        ]
+    catch e
+        @warn "Error processing timestamp: $ts"
+        return [0.0, 0.0, 0.0]  # Default values
+    end
+end
+
+"""
+Validate and preprocess input data
+"""
+function validate_data(df::DataFrame)
+    df_clean = copy(df)
+    
+    # Convert columns to appropriate types
+    df_clean.Timestamp = String.(df_clean.Timestamp)
+    df_clean.Source_IP = String.(df_clean.Source_IP)
+    df_clean.Destination_IP = String.(df_clean.Destination_IP)
+    df_clean.Protocol = String.(df_clean.Protocol)
+    df_clean.Attack_Type = String.(df_clean.Attack_Type)
+    df_clean.Packet_Size = Float64.(df_clean.Packet_Size)
+    df_clean.Request_Rate = Float64.(df_clean.Request_Rate)
+    
+    return df_clean
 end
 
 """
@@ -160,23 +190,26 @@ end
 Preprocess data and engineer features
 """
 function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=true)
+    # Validate input data
+    df_clean = validate_data(df)
+    
     if training
-        model.attack_types = unique(df.Attack_Type)
-        model.protocols = unique(df.Protocol)
+        model.attack_types = unique(df_clean.Attack_Type)
+        model.protocols = unique(df_clean.Protocol)
     end
     
-    n_samples = nrow(df)
+    n_samples = nrow(df_clean)
     features = Vector{Float64}[]
     
     for i in 1:n_samples
         row_features = Float64[]
         
         # Process timestamp
-        append!(row_features, process_timestamp(df[i, :Timestamp]))
+        append!(row_features, process_timestamp(df_clean[i, :Timestamp]))
         
         # Process IPs
-        source_ip = IPAddress(df[i, :Source_IP])
-        dest_ip = IPAddress(df[i, :Destination_IP])
+        source_ip = IPAddress(df_clean[i, :Source_IP])
+        dest_ip = IPAddress(df_clean[i, :Destination_IP])
         
         append!(row_features, extract_ip_features(source_ip))
         append!(row_features, extract_ip_features(dest_ip))
@@ -184,14 +217,14 @@ function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=tr
         
         # Process protocol features
         append!(row_features, calculate_protocol_features(
-            df[i, :Protocol],
-            df[i, :Packet_Size],
-            df[i, :Request_Rate]
+            df_clean[i, :Protocol],
+            df_clean[i, :Packet_Size],
+            df_clean[i, :Request_Rate]
         ))
         
         # Add raw metrics
-        push!(row_features, Float64(df[i, :Packet_Size]))
-        push!(row_features, Float64(df[i, :Request_Rate]))
+        push!(row_features, Float64(df_clean[i, :Packet_Size]))
+        push!(row_features, Float64(df_clean[i, :Request_Rate]))
         
         push!(features, row_features)
     end
@@ -224,8 +257,7 @@ function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=tr
         fit!(mach)
         X_scaled = transform(mach, X_table)
     else
-        mach = machine(model.scaler, X_table)
-        X_scaled = transform(mach, X_table)
+        X_scaled = transform(model.machine.fitresult.scaler_machine, X_table)
     end
     
     return X_scaled
@@ -251,6 +283,7 @@ function train!(model::NetworkTrafficModel, df::DataFrame)
     
     println("\nTraining final model...")
     fit!(mach)
+    model.machine = mach  # Store the fitted machine
     
     return Dict(
         "cv_scores" => cv_scores.per_fold,
@@ -262,12 +295,13 @@ end
 Make predictions with detailed analysis
 """
 function predict(model::NetworkTrafficModel, df::DataFrame)
-    X = preprocess_data!(model, df, training=false)
-    mach = machine(model.model, X)
-    fit!(mach)
+    if isnothing(model.machine)
+        error("Model must be trained before making predictions")
+    end
     
-    predictions = predict(mach, X)
-    probabilities = predict_mode(mach, X)
+    X = preprocess_data!(model, df, training=false)
+    predictions = MLJ.predict(model.machine, X)
+    probabilities = MLJ.predict_mode(model.machine, X)
     
     # Create results DataFrame
     results = DataFrame(
@@ -295,28 +329,43 @@ function predict(model::NetworkTrafficModel, df::DataFrame)
     return results
 end
 
-# Example usage
 function main()
-    println("Loading data...")
-    df = CSV.read("network_traffic.csv", DataFrame)
-    
-    println("\nInitializing model...")
-    model = NetworkTrafficModel()
-    
-    println("\nTraining model...")
-    train_results = train!(model, df)
-    
-    println("\nMaking predictions...")
-    predictions = predict(model, df)
-    
-    println("\nSample predictions:")
-    first_predictions = first(predictions, 5)
-    for row in eachrow(first_predictions)
-        println("\nSource IP: $(row.Source_IP) → Destination IP: $(row.Destination_IP)")
-        println("Protocol: $(row.Protocol)")
-        println("Predicted Attack: $(row.Predicted_Attack)")
-        println("Confidence: $(round(row.Confidence, digits=1))%")
-        println("Risk Level: $(row.Risk_Level)")
+    try
+        println("Loading data...")
+        df = CSV.read("network_traffic.csv", DataFrame)
+        
+        println("\nData Overview:")
+        println("Number of records: ", nrow(df))
+        println("Attack Types: ", unique(df.Attack_Type))
+        println("Protocols: ", unique(df.Protocol))
+        
+        println("\nInitializing model...")
+        model = NetworkTrafficModel()
+        
+        println("\nTraining model...")
+        train_results = train!(model, df)
+        
+        println("\nMaking predictions...")
+        predictions = predict(model, df)
+        
+        println("\nSample predictions:")
+        first_predictions = first(predictions, 5)
+        for row in eachrow(first_predictions)
+            println("\nSource IP: $(row.Source_IP) → Destination IP: $(row.Destination_IP)")
+            println("Protocol: $(row.Protocol)")
+            println("Predicted Attack: $(row.Predicted_Attack)")
+            println("Confidence: $(round(row.Confidence, digits=1))%")
+            println("Risk Level: $(row.Risk_Level)")
+        end
+        
+    catch e
+        println("\nError occurred during execution:")
+        println(e)
+        println("\nStacktrace:")
+        for (exc, bt) in Base.catch_stack()
+            showerror(stdout, exc, bt)
+            println()
+        end
     end
 end
 
