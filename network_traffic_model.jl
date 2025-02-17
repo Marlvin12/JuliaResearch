@@ -6,8 +6,8 @@ using Random
 using MLJ
 using LinearAlgebra
 
-# Load MLJ models
-RandomForestClassifier = @load RandomForestClassifier pkg=DecisionTree
+# Load MLJ model
+RandomForestClassifier = @load RandomForestClassifier pkg="MLJDecisionTreeInterface"
 
 """
 Structure to handle IP address features
@@ -215,14 +215,17 @@ function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=tr
         ]
     end
     
+    # Create MLJ table from features
+    X_table = MLJ.table(X, names=Symbol.(model.feature_names))
+    
     # Scale features
     if training
-        mach = machine(model.scaler, X)
+        mach = machine(model.scaler, X_table)
         fit!(mach)
-        X_scaled = transform(mach, X)
+        X_scaled = transform(mach, X_table)
     else
-        mach = machine(model.scaler, X)
-        X_scaled = transform(mach, X)
+        mach = machine(model.scaler, X_table)
+        X_scaled = transform(mach, X_table)
     end
     
     return X_scaled
@@ -249,17 +252,6 @@ function train!(model::NetworkTrafficModel, df::DataFrame)
     println("\nTraining final model...")
     fit!(mach)
     
-    # Get feature importances if available
-    if hasproperty(model.model, :feature_importances)
-        importances = feature_importance(mach)
-        println("\nTop 10 Most Important Features:")
-        sorted_features = sort(collect(zip(model.feature_names, importances)), 
-                             by=x->x[2], rev=true)
-        for (feature, importance) in sorted_features[1:10]
-            println("$feature: $(round(importance, digits=3))")
-        end
-    end
-    
     return Dict(
         "cv_scores" => cv_scores.per_fold,
         "mean_cv_score" => cv_scores.measurement[1]
@@ -267,36 +259,29 @@ function train!(model::NetworkTrafficModel, df::DataFrame)
 end
 
 """
-Make predictions with confidence scores
+Make predictions with detailed analysis
 """
 function predict(model::NetworkTrafficModel, df::DataFrame)
     X = preprocess_data!(model, df, training=false)
-    predictions = model.model.predict(X)
-    probabilities = model.model.predict_proba(X)
+    mach = machine(model.model, X)
+    fit!(mach)
     
-    # Convert numeric predictions back to attack types
-    predicted_attacks = model.attack_types[predictions .+ 1]
+    predictions = predict(mach, X)
+    probabilities = predict_mode(mach, X)
     
     # Create results DataFrame
     results = DataFrame(
         Source_IP = df.Source_IP,
         Destination_IP = df.Destination_IP,
         Protocol = df.Protocol,
-        Predicted_Attack = predicted_attacks,
-        Confidence = [maximum(prob) * 100 for prob in probabilities]
+        Predicted_Attack = predictions,
+        Confidence = [maximum(pdf(prob)) * 100 for prob in probabilities]
     )
     
     # Add risk assessment
     results.Risk_Level = map(1:nrow(df)) do i
         confidence = results[i, :Confidence]
-        protocol_risk = calculate_protocol_features(
-            df[i, :Protocol],
-            df[i, :Packet_Size],
-            df[i, :Request_Rate]
-        )[3]  # Get protocol risk score
-        
-        # Combined risk score
-        risk_score = (confidence/100 + protocol_risk) / 2
+        risk_score = confidence / 100
         
         if risk_score > 0.8
             "High"
@@ -310,49 +295,6 @@ function predict(model::NetworkTrafficModel, df::DataFrame)
     return results
 end
 
-"""
-Evaluate model performance
-"""
-function evaluate_model(model::NetworkTrafficModel, df::DataFrame)
-    X = preprocess_data!(model, df, training=false)
-    
-    # Get true and predicted labels
-    label_map = Dict(attack => i-1 for (i, attack) in enumerate(model.attack_types))
-    y_true = [label_map[attack] for attack in df.Attack_Type]
-    y_pred = model.model.predict(X)
-    
-    # Calculate confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    
-    # Print classification report
-    println("\nClassification Report:")
-    println(classification_report(y_true, y_pred, 
-                                target_names=model.attack_types))
-    
-    # Calculate per-class metrics
-    println("\nPer-Class Performance:")
-    for (i, attack_type) in enumerate(model.attack_types)
-        true_pos = cm[i,i]
-        false_pos = sum(cm[:,i]) - true_pos
-        false_neg = sum(cm[i,:]) - true_pos
-        
-        precision = true_pos / (true_pos + false_pos)
-        recall = true_pos / (true_pos + false_neg)
-        f1 = 2 * (precision * recall) / (precision + recall)
-        
-        println("\n$attack_type:")
-        println("Precision: $(round(precision, digits=3))")
-        println("Recall: $(round(recall, digits=3))")
-        println("F1-score: $(round(f1, digits=3))")
-    end
-    
-    return Dict(
-        "confusion_matrix" => cm,
-        "classification_report" => classification_report(y_true, y_pred, 
-                                                      target_names=model.attack_types)
-    )
-end
-
 # Example usage
 function main()
     println("Loading data...")
@@ -363,9 +305,6 @@ function main()
     
     println("\nTraining model...")
     train_results = train!(model, df)
-    
-    println("\nEvaluating model...")
-    eval_results = evaluate_model(model, df)
     
     println("\nMaking predictions...")
     predictions = predict(model, df)
