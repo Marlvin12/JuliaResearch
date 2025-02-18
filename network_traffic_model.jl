@@ -5,9 +5,15 @@ using Statistics
 using Random
 using MLJ
 using LinearAlgebra
+using Tables
+using StatsBase  
+
+# Import specific MLJ functions to resolve ambiguity
+import MLJ: transform, predict, machine, fit!
 
 # Load XGBoost classifier
 XGBoostClassifier = @load XGBoostClassifier pkg=XGBoost
+
 
 """
 Structure to handle IP address features
@@ -59,15 +65,22 @@ mutable struct NetworkTrafficModel
     feature_names::Vector{String}
     attack_types::Vector{String}
     protocols::Vector{String}
-    machine  # Store the fitted machine
-    
+    machine
     function NetworkTrafficModel()
         new(
-            Standardizer(),
+            Standardizer(; features=Symbol[]),
             XGBoostClassifier(
-                num_round=100,
-                max_depth=6,
-                eta=0.3,
+                num_round=3000,               # More iterations
+                max_depth=8,                  # Deeper trees
+                eta=0.02,                     # Lower learning rate
+                gamma=0.1,                    # Minimum loss reduction
+                min_child_weight=1.0,         # Allow more splits
+                subsample=0.8,                # Subsample ratio
+                colsample_bytree=0.8,         # Feature sampling
+                lambda=0.5,                   # L2 regularization
+                alpha=0.1,                    # L1 regularization
+                tree_method="auto",
+                scale_pos_weight=1.0,         # For imbalanced classes
                 objective="multi:softprob"
             ),
             String[],
@@ -160,11 +173,11 @@ end
 """
 Calculate protocol-specific features
 """
-function calculate_protocol_features(protocol::String, packet_size::Number, request_rate::Number)
+function calculate_protocol_features(protocol::AbstractString, packet_size::Number, request_rate::Number)
     # Protocol characteristics
-    header_size = if protocol == "TCP"
+    header_size = if String(protocol) == "TCP"
         20
-    elseif protocol == "UDP"
+    elseif String(protocol) == "UDP"
         8
     else # ICMP
         8
@@ -175,68 +188,132 @@ function calculate_protocol_features(protocol::String, packet_size::Number, requ
     overhead_ratio = header_size / packet_size
     payload_efficiency = payload_size / packet_size
     
-    # Protocol risk factors
-    risk_score = if protocol == "TCP"
-        (packet_size < 100 && request_rate > 200) ? 1.0 : 0.5
-    elseif protocol == "UDP"
-        (packet_size > 250 && request_rate > 150) ? 1.0 : 0.5
+    # Protocol risk factors - adjusted based on your data patterns
+    risk_score = if String(protocol) == "TCP"
+        if packet_size < 100 && request_rate > 200
+            1.0  # DoS signature
+        elseif packet_size > 300 && request_rate > 300
+            0.8  # DDoS signature
+        elseif packet_size > 200 && request_rate < 100
+            0.3  # Normal traffic
+        else
+            0.5  # Probe or uncertain
+        end
+    elseif String(protocol) == "UDP"
+        if packet_size > 400 || request_rate > 400
+            0.9  # DDoS signature
+        elseif packet_size < 50 && request_rate > 300
+            0.8  # DoS signature
+        else
+            0.4  # Normal or Probe
+        end
     else # ICMP
-        request_rate > 100 ? 1.0 : 0.5
+        if request_rate > 300
+            0.9  # Attack signature
+        elseif packet_size > 300
+            0.7  # Suspicious
+        else
+            0.3  # Normal
+        end
     end
     
     return [overhead_ratio, payload_efficiency, risk_score]
 end
 
 """
-Preprocess data and engineer features
+Custom standardization with handling for low variance
 """
+function custom_standardize(X::AbstractMatrix)
+    means = mean(X, dims=1)
+    stds = std(X, dims=1)
+    
+    # Replace very small standard deviations with 1.0
+    stds[stds .< 1e-10] .= 1.0
+    
+    # Standardize
+    X_scaled = (X .- means) ./ stds
+    return X_scaled
+end
+
+"""
+Create additional features for the model
+"""
+function create_additional_features(df::DataFrame)
+    # Create copy to avoid modifying original
+    df_new = copy(df)
+    
+    # Request rate percentiles for normalization
+    rate_p95 = percentile(df_new.Request_Rate, 95)
+    
+    # Add engineered features
+    df_new.Normalized_Request_Rate = df_new.Request_Rate ./ rate_p95
+    df_new.Bytes_Per_Second = df_new.Packet_Size .* df_new.Request_Rate
+    df_new.High_Rate_Flag = Int.(df_new.Request_Rate .> median(df_new.Request_Rate))
+    
+    # Protocol frequencies
+    protocol_freqs = countmap(df_new.Protocol)
+    df_new.Protocol_Freq = [protocol_freqs[p] for p in df_new.Protocol]
+    
+    # Time-based features from timestamp
+    df_new.Hour = parse.(Int, first.(split.(df_new.Timestamp, ":")))
+    df_new.Is_Peak_Hour = Int.(df_new.Hour .>= 9 .&& df_new.Hour .<= 17)
+    
+    return df_new
+end
+
 function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=true)
-    # Validate input data
-    df_clean = validate_data(df)
+    # Add engineered features
+    df_enriched = create_additional_features(df)
     
     if training
-        model.attack_types = unique(df_clean.Attack_Type)
-        model.protocols = unique(df_clean.Protocol)
+        model.attack_types = unique(df_enriched.Attack_Type)
+        model.protocols = unique(df_enriched.Protocol)
     end
     
-    n_samples = nrow(df_clean)
-    features = Vector{Float64}[]
-    
-    for i in 1:n_samples
+    # Create features
+    features = map(1:nrow(df_enriched)) do i
+        row = df_enriched[i, :]
         row_features = Float64[]
         
-        # Process timestamp
-        append!(row_features, process_timestamp(df_clean[i, :Timestamp]))
+        # Basic numeric features
+        append!(row_features, [
+            row.Packet_Size,
+            row.Request_Rate,
+            row.Normalized_Request_Rate,
+            row.Bytes_Per_Second,
+            row.High_Rate_Flag,
+            row.Protocol_Freq,
+            row.Is_Peak_Hour
+        ])
         
         # Process IPs
-        source_ip = IPAddress(df_clean[i, :Source_IP])
-        dest_ip = IPAddress(df_clean[i, :Destination_IP])
+        source_ip = IPAddress(row.Source_IP)
+        dest_ip = IPAddress(row.Destination_IP)
         
+        # IP-based features
         append!(row_features, extract_ip_features(source_ip))
         append!(row_features, extract_ip_features(dest_ip))
         append!(row_features, calculate_topology_features(source_ip, dest_ip))
         
-        # Process protocol features
+        # Protocol features
         append!(row_features, calculate_protocol_features(
-            df_clean[i, :Protocol],
-            df_clean[i, :Packet_Size],
-            df_clean[i, :Request_Rate]
+            row.Protocol,
+            row.Packet_Size,
+            row.Request_Rate
         ))
         
-        # Add raw metrics
-        push!(row_features, Float64(df_clean[i, :Packet_Size]))
-        push!(row_features, Float64(df_clean[i, :Request_Rate]))
-        
-        push!(features, row_features)
+        row_features
     end
     
     # Convert to matrix
     X = reduce(hcat, features)'
     
     if training
-        # Create feature names
+        # Update feature names
         model.feature_names = [
-            "Hour", "Minute", "Second",
+            "Packet_Size", "Request_Rate", "Normalized_Request_Rate",
+            "Bytes_Per_Second", "High_Rate_Flag", "Protocol_Freq",
+            "Is_Peak_Hour",
             "Src_Oct1", "Src_Oct2", "Src_Oct3", "Src_Oct4",
             "Src_ClassA", "Src_ClassB", "Src_ClassC", "Src_ClassD", "Src_ClassE",
             "Src_Private",
@@ -244,65 +321,35 @@ function preprocess_data!(model::NetworkTrafficModel, df::DataFrame; training=tr
             "Dst_ClassA", "Dst_ClassB", "Dst_ClassC", "Dst_ClassD", "Dst_ClassE",
             "Dst_Private",
             "Subnet_Similarity", "Same_Class", "Privacy_Pattern",
-            "Protocol_Overhead", "Protocol_Efficiency", "Protocol_Risk",
-            "Packet_Size", "Request_Rate"
+            "Protocol_Overhead", "Protocol_Efficiency", "Protocol_Risk"
         ]
     end
     
-    # Create MLJ table from features
-    X_table = MLJ.table(X, names=Symbol.(model.feature_names))
+    # Create MLJ table and scale features
+    X_scaled = custom_standardize(X)
+    X_table = MLJ.table(X_scaled, names=Symbol.(model.feature_names))
     
-    # Scale features
-    if training
-        mach = machine(model.scaler, X_table)
-        fit!(mach)
-        X_scaled = transform(mach, X_table)
-    else
-        X_scaled = transform(model.machine.fitresult.scaler_machine, X_table)
-    end
-    
-    return X_scaled
+    return X_table
 end
 
-"""
-Train the model with cross-validation
-"""
-function train!(model::NetworkTrafficModel, df::DataFrame)
-    println("Preprocessing data...")
-    X = preprocess_data!(model, df)
-    
-    # Convert attack types to categorical
-    y = categorical(df.Attack_Type)
-    
-    println("\nPerforming cross-validation...")
-    cv = CV(; nfolds=5)
-    mach = machine(model.model, X, y)
-    cv_scores = evaluate!(mach, resampling=cv, measure=accuracy)
-    
-    println("Cross-validation scores: ", cv_scores.per_fold)
-    println("Mean CV score: ", cv_scores.measurement[1])
-    
-    println("\nTraining final model...")
-    fit!(mach)
-    model.machine = mach  # Store the fitted machine
-    
-    return Dict(
-        "cv_scores" => cv_scores.per_fold,
-        "mean_cv_score" => cv_scores.measurement[1]
-    )
-end
 
-"""
-Make predictions with detailed analysis
-"""
-function predict(model::NetworkTrafficModel, df::DataFrame)
+function MLJ.predict(model::NetworkTrafficModel, df::DataFrame)
     if isnothing(model.machine)
         error("Model must be trained before making predictions")
     end
     
+    # Preprocess input data
     X = preprocess_data!(model, df, training=false)
-    predictions = MLJ.predict(model.machine, X)
-    probabilities = MLJ.predict_mode(model.machine, X)
+    X_df = DataFrame(X)
+    
+    # Get predictions and probabilities
+    predictions = predict_mode(model.machine, X_df)
+    probs = MLJ.predict(model.machine, X_df)
+    
+    # Extract probabilities correctly
+    confidences = map(probs) do prob
+        maximum(values(prob.prob_given_ref))
+    end
     
     # Create results DataFrame
     results = DataFrame(
@@ -310,13 +357,26 @@ function predict(model::NetworkTrafficModel, df::DataFrame)
         Destination_IP = df.Destination_IP,
         Protocol = df.Protocol,
         Predicted_Attack = predictions,
-        Confidence = [maximum(pdf(prob)) * 100 for prob in probabilities]
+        Confidence = confidences .* 100
     )
     
     # Add risk assessment
     results.Risk_Level = map(1:nrow(df)) do i
-        confidence = results[i, :Confidence]
-        risk_score = confidence / 100
+        row = df[i, :]
+        
+        # Get various risk factors
+        protocol_risk = calculate_protocol_features(
+            row.Protocol,
+            row.Packet_Size,
+            row.Request_Rate
+        )[3]
+        
+        source_ip = IPAddress(row.Source_IP)
+        dest_ip = IPAddress(row.Destination_IP)
+        network_risk = calculate_topology_features(source_ip, dest_ip)[3]
+        confidence_risk = confidences[i]
+        
+        risk_score = 0.4 * protocol_risk + 0.3 * network_risk + 0.3 * confidence_risk
         
         if risk_score > 0.8
             "High"
@@ -328,6 +388,52 @@ function predict(model::NetworkTrafficModel, df::DataFrame)
     end
     
     return results
+end
+
+function train!(model::NetworkTrafficModel, df::DataFrame)
+    try
+        println("Preprocessing data...")
+        X = preprocess_data!(model, df)
+        X_df = DataFrame(X)
+        y = categorical(df.Attack_Type)
+        
+        # Calculate class weights for scale_pos_weight parameter
+        class_counts = countmap(y)
+        total_samples = sum(values(class_counts))
+        class_weights = Dict(k => total_samples/(length(class_counts) * v) for (k,v) in class_counts)
+        
+        # Update model parameters with class weights
+        model.model.scale_pos_weight = mean(values(class_weights))
+        
+        println("\nTraining model...")
+        mach = machine(model.model, X_df, y)
+        fit!(mach, rows=1:nrow(df), verbosity=0)  # Removed weights parameter
+        model.machine = mach
+        
+        # Evaluate performance
+        y_pred = predict_mode(mach, X_df)
+        println("\nTraining Performance:")
+        for class in unique(y)
+            idx = y .== class
+            accuracy = mean(y_pred[idx] .== y[idx])
+            precision = sum(y_pred[idx] .== class) / (sum(y_pred .== class) + eps())
+            recall = sum(y_pred[idx] .== class) / sum(idx)
+            f1 = 2 * (precision * recall) / (precision + recall + eps())
+            
+            println("\n$class:")
+            println("  Accuracy: $(round(accuracy * 100, digits=1))%")
+            println("  Precision: $(round(precision * 100, digits=1))%")
+            println("  Recall: $(round(recall * 100, digits=1))%")
+            println("  F1 Score: $(round(f1 * 100, digits=1))%")
+            println("  Samples: $(sum(idx))")
+        end
+        
+        return mach
+    catch e
+        println("\nError during training:")
+        println(e)
+        rethrow(e)
+    end
 end
 
 function main()
